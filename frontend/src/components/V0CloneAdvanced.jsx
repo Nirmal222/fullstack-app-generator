@@ -1,12 +1,76 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Editor from '@monaco-editor/react';
 import { SandpackProvider, SandpackPreview, useSandpack } from '@codesandbox/sandpack-react';
 import './V0CloneAdvanced.css';
 
+// Preview Error Monitor Component
+const PreviewErrorMonitor = ({ onErrorDetected }) => {
+  const { sandpack } = useSandpack();
+
+  useEffect(() => {
+    // Monitor for any error state
+    if (sandpack.error) {
+      onErrorDetected(sandpack.error);
+    }
+    
+    // Monitor status changes
+    if (sandpack.status === 'error') {
+      const errorMsg = sandpack.error?.message || 'Build error occurred';
+      onErrorDetected({ message: errorMsg });
+    }
+  }, [sandpack.error, sandpack.status, onErrorDetected]);
+
+  return null; // This component doesn't render anything
+};
+
 // Custom Editor Component with Monaco
-const MonacoEditor = ({ files, activeFile, onFileChange }) => {
+const MonacoEditor = ({ files, activeFile, onFileChange, onErrorDetected }) => {
   const { sandpack } = useSandpack();
   const editorRef = useRef(null);
+
+  // Listen for all types of errors from Sandpack
+  useEffect(() => {
+    // Runtime errors
+    if (sandpack.error) {
+      onErrorDetected(sandpack.error);
+    }
+    
+    // Build/compilation errors
+    if (sandpack.status === 'error') {
+      const errorMessage = sandpack.error?.message || 'Build error occurred';
+      onErrorDetected({ message: errorMessage });
+    }
+  }, [sandpack.error, sandpack.status, onErrorDetected]);
+
+  // Listen to console logs for additional errors
+  useEffect(() => {
+    const consoleListener = (logs) => {
+      logs.forEach(log => {
+        if (log.level === 'error') {
+          onErrorDetected({ 
+            message: log.data.join(' '),
+            source: 'console'
+          });
+        }
+      });
+    };
+
+    // If Sandpack has console logs, listen to them
+    if (sandpack.listen) {
+      const unsubscribe = sandpack.listen((message) => {
+        if (message.type === 'console' && message.log?.level === 'error') {
+          onErrorDetected({
+            message: message.log.data.join(' '),
+            source: 'console'
+          });
+        }
+      });
+      
+      return () => {
+        if (unsubscribe) unsubscribe();
+      };
+    }
+  }, [sandpack, onErrorDetected]);
 
   const handleEditorDidMount = (editor) => {
     editorRef.current = editor;
@@ -66,7 +130,7 @@ const V0CloneAdvanced = () => {
   const [prompt, setPrompt] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [files, setFiles] = useState({
-    'src/App.js': `import React, { useState } from 'react';
+    '/App.js': `import React, { useState } from 'react';
 import './App.css';
 
 export default function App() {
@@ -84,7 +148,7 @@ export default function App() {
     </div>
   );
 }`,
-    'src/App.css': `.app {
+    '/App.css': `.app {
   text-align: center;
   padding: 40px;
   font-family: system-ui, -apple-system, sans-serif;
@@ -121,7 +185,7 @@ h1 {
   font-size: 24px;
   font-weight: bold;
 }`,
-    'src/components/Button.jsx': `import React from 'react';
+    '/components/Button.jsx': `import React from 'react';
 import './Button.css';
 
 export default function Button({ children, onClick }) {
@@ -131,7 +195,7 @@ export default function Button({ children, onClick }) {
     </button>
   );
 }`,
-    'src/components/Button.css': `.custom-button {
+    '/components/Button.css': `.custom-button {
   padding: 12px 24px;
   font-size: 16px;
   font-weight: 600;
@@ -149,11 +213,15 @@ export default function Button({ children, onClick }) {
 }`
   });
   
-  const [activeFile, setActiveFile] = useState('src/App.js');
-  const [expandedFolders, setExpandedFolders] = useState({ 'src': true, 'src/components': true });
+  const [activeFile, setActiveFile] = useState('/App.js');
+  const [expandedFolders, setExpandedFolders] = useState({ 'components': true });
   const [generationLog, setGenerationLog] = useState([]);
   const [viewMode, setViewMode] = useState('code'); // 'code' or 'preview'
   const [showChat, setShowChat] = useState(true);
+  const [error, setError] = useState(null);
+  const [retryCount, setRetryCount] = useState(0);
+  const [runtimeErrors, setRuntimeErrors] = useState([]);
+  const [isFixing, setIsFixing] = useState(false);
 
   // File operations
   const handleFileChange = (filePath, content) => {
@@ -168,7 +236,9 @@ export default function Button({ children, onClick }) {
     const tree = {};
     
     filePaths.forEach(path => {
-      const parts = path.split('/');
+      // Remove leading slash if present for tree building
+      const cleanPath = path.startsWith('/') ? path.slice(1) : path;
+      const parts = cleanPath.split('/').filter(p => p); // Filter empty parts
       let current = tree;
       
       parts.forEach((part, index) => {
@@ -249,13 +319,19 @@ export default function Button({ children, onClick }) {
 
   // Code generation
   const generateCode = async () => {
-    if (!prompt.trim()) return;
+    if (!prompt.trim()) {
+      setError('Please enter a prompt to generate code');
+      return;
+    }
 
     setIsGenerating(true);
     setGenerationLog([]);
+    setError(null);
     const newFiles = {};
+    let hasReceivedData = false;
 
     try {
+      // Check if backend is reachable
       const response = await fetch('http://localhost:8000/api/generate', {
         method: 'POST',
         headers: {
@@ -265,12 +341,204 @@ export default function Button({ children, onClick }) {
           prompt: prompt,
           framework: 'react',
           model: 'gpt-4'
-        })
+        }),
+        signal: AbortSignal.timeout(120000) // 2 minute timeout
       });
+
+      if (!response.ok) {
+        throw new Error(`Server responded with status ${response.status}`);
+      }
+
+      if (!response.body) {
+        throw new Error('Response body is empty');
+      }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
 
+      let currentFile = null;
+      let currentContent = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          if (!hasReceivedData) {
+            throw new Error('No data received from server');
+          }
+          break;
+        }
+
+        hasReceivedData = true;
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+
+              switch (data.type) {
+              case 'file_start':
+                currentFile = data.file_path;
+                currentContent = '';
+                setGenerationLog(prev => [...prev, `📄 Creating ${data.file_path}...`]);
+                break;
+
+              case 'content':
+                currentContent += data.content;
+                // Convert backend paths to Sandpack-compatible paths
+                // src/App.jsx -> /App.js, src/App.css -> /App.css, etc.
+                let sandpackPath = currentFile;
+                
+                // Remove 'src/' prefix if present
+                if (sandpackPath.startsWith('src/')) {
+                  sandpackPath = sandpackPath.slice(4);
+                }
+                
+                // Ensure leading slash
+                if (!sandpackPath.startsWith('/')) {
+                  sandpackPath = '/' + sandpackPath;
+                }
+                
+                // Convert .jsx to .js for compatibility
+                sandpackPath = sandpackPath.replace(/\.jsx$/, '.js');
+                
+                newFiles[sandpackPath] = currentContent;
+                setFiles({ ...newFiles });
+                break;
+
+              case 'file_end':
+                setGenerationLog(prev => [...prev, `✅ Completed ${data.file_path}`]);
+                // Use the same path transformation
+                let finalPath = data.file_path;
+                if (finalPath.startsWith('src/')) {
+                  finalPath = finalPath.slice(4);
+                }
+                if (!finalPath.startsWith('/')) {
+                  finalPath = '/' + finalPath;
+                }
+                finalPath = finalPath.replace(/\.jsx$/, '.js');
+                
+                if (Object.keys(newFiles).length === 1) {
+                  setActiveFile(finalPath);
+                }
+                break;
+
+              case 'complete':
+                setGenerationLog(prev => [...prev, `🎉 ${data.metadata.message}`]);
+                setIsGenerating(false);
+                break;
+
+              case 'error':
+                setGenerationLog(prev => [...prev, `❌ Error: ${data.message}`]);
+                setError(data.message);
+                setIsGenerating(false);
+                break;
+
+              default:
+                console.warn('Unknown message type:', data.type);
+            }
+            } catch (parseError) {
+              console.error('Error parsing server message:', parseError);
+              setGenerationLog(prev => [...prev, `⚠️ Warning: Could not parse server message`]);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Generation error:', error);
+      
+      let errorMessage = 'An unexpected error occurred';
+      
+      if (error.name === 'AbortError' || error.message.includes('timeout')) {
+        errorMessage = 'Request timed out. The server took too long to respond. Please try a simpler prompt.';
+      } else if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
+        errorMessage = 'Cannot connect to backend server. Please ensure the server is running at http://localhost:8000';
+      } else if (error.message.includes('status')) {
+        errorMessage = `Server error: ${error.message}. Please try again.`;
+      } else {
+        errorMessage = error.message || 'An unexpected error occurred';
+      }
+      
+      setError(errorMessage);
+      setGenerationLog(prev => [...prev, `❌ ${errorMessage}`]);
+      setIsGenerating(false);
+    }
+  };
+
+  // Retry generation
+  const retryGeneration = () => {
+    setRetryCount(prev => prev + 1);
+    setError(null);
+    generateCode();
+  };
+
+  // Clear error
+  const clearError = () => {
+    setError(null);
+    setGenerationLog([]);
+  };
+
+  // Handle runtime errors from Sandpack
+  const handleRuntimeError = useCallback((error) => {
+    if (error) {
+      const errorInfo = {
+        message: error.message || 'Unknown error',
+        line: error.line,
+        column: error.column,
+        path: error.path
+      };
+      
+      setRuntimeErrors(prev => {
+        const isDuplicate = prev.some(e => e.message === errorInfo.message);
+        if (!isDuplicate) {
+          return [...prev, errorInfo];
+        }
+        return prev;
+      });
+    }
+  }, []);
+
+  // Fix errors using Claude
+  const fixErrors = async () => {
+    if (runtimeErrors.length === 0) return;
+
+    setIsFixing(true);
+    setGenerationLog([]);
+
+    try {
+      // Prepare error context
+      const errorContext = runtimeErrors.map(err => 
+        `Error: ${err.message}${err.path ? ` in ${err.path}` : ''}${err.line ? ` at line ${err.line}` : ''}`
+      ).join('\n');
+
+      // Prepare current code
+      const currentCode = Object.entries(files).map(([path, content]) => 
+        `File: ${path}\n\`\`\`\n${content}\n\`\`\``
+      ).join('\n\n');
+
+      const fixPrompt = `I have the following errors in my React application:\n\n${errorContext}\n\nHere's the current code:\n\n${currentCode}\n\nPlease fix these errors and return the corrected code with the same file structure.`;
+
+      const response = await fetch('http://localhost:8000/api/generate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          prompt: fixPrompt,
+          framework: 'react',
+          model: 'gpt-4'
+        }),
+        signal: AbortSignal.timeout(120000)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server responded with status ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      const newFiles = {};
       let currentFile = null;
       let currentContent = '';
 
@@ -283,46 +551,62 @@ export default function Button({ children, onClick }) {
 
         for (const line of lines) {
           if (line.startsWith('data: ')) {
-            const data = JSON.parse(line.slice(6));
+            try {
+              const data = JSON.parse(line.slice(6));
 
-            switch (data.type) {
-              case 'file_start':
-                currentFile = data.file_path;
-                currentContent = '';
-                setGenerationLog(prev => [...prev, `📄 Creating ${data.file_path}...`]);
-                break;
+              switch (data.type) {
+                case 'file_start':
+                  currentFile = data.file_path;
+                  currentContent = '';
+                  setGenerationLog(prev => [...prev, `🔧 Fixing ${data.file_path}...`]);
+                  break;
 
-              case 'content':
-                currentContent += data.content;
-                newFiles[currentFile] = currentContent;
-                setFiles({ ...newFiles });
-                break;
+                case 'content':
+                  currentContent += data.content;
+                  let sandpackPath = currentFile;
+                  if (sandpackPath.startsWith('src/')) {
+                    sandpackPath = sandpackPath.slice(4);
+                  }
+                  if (!sandpackPath.startsWith('/')) {
+                    sandpackPath = '/' + sandpackPath;
+                  }
+                  sandpackPath = sandpackPath.replace(/\.jsx$/, '.js');
+                  newFiles[sandpackPath] = currentContent;
+                  setFiles({ ...newFiles });
+                  break;
 
-              case 'file_end':
-                setGenerationLog(prev => [...prev, `✅ Completed ${data.file_path}`]);
-                if (Object.keys(newFiles).length === 1) {
-                  setActiveFile(currentFile);
-                }
-                break;
+                case 'file_end':
+                  setGenerationLog(prev => [...prev, `✅ Fixed ${data.file_path}`]);
+                  break;
 
-              case 'complete':
-                setGenerationLog(prev => [...prev, `🎉 ${data.metadata.message}`]);
-                setIsGenerating(false);
-                break;
+                case 'complete':
+                  setGenerationLog(prev => [...prev, `🎉 Errors fixed successfully!`]);
+                  setRuntimeErrors([]);
+                  setIsFixing(false);
+                  break;
 
-              case 'error':
-                setGenerationLog(prev => [...prev, `❌ Error: ${data.message}`]);
-                setIsGenerating(false);
-                break;
+                case 'error':
+                  setGenerationLog(prev => [...prev, `❌ Error: ${data.message}`]);
+                  setError(data.message);
+                  setIsFixing(false);
+                  break;
+              }
+            } catch (parseError) {
+              console.error('Error parsing server message:', parseError);
             }
           }
         }
       }
     } catch (error) {
-      console.error('Generation error:', error);
-      setGenerationLog(prev => [...prev, `❌ Connection error: ${error.message}`]);
-      setIsGenerating(false);
+      console.error('Fix error:', error);
+      setError('Failed to fix errors. Please try again.');
+      setIsFixing(false);
     }
+  };
+
+  // Clear runtime errors
+  const clearRuntimeErrors = () => {
+    setRuntimeErrors([]);
   };
 
   const getFileIcon = (filename) => {
@@ -443,21 +727,102 @@ export default function Button({ children, onClick }) {
 
               <div className="prompt-section">
                 <label>Generate Code</label>
+                {error && (
+                  <div className="error-banner">
+                    <span className="error-icon">⚠️</span>
+                    <span className="error-text">{error}</span>
+                    <button className="error-close" onClick={clearError}>×</button>
+                  </div>
+                )}
+                {isGenerating && (
+                  <div className="loading-banner">
+                    <div className="loading-spinner"></div>
+                    <div className="loading-content">
+                      <span className="loading-text">AI is generating your code...</span>
+                      <span className="loading-subtext">This may take a few seconds</span>
+                    </div>
+                  </div>
+                )}
                 <textarea
                   value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
+                  onChange={(e) => {
+                    setPrompt(e.target.value);
+                    if (error) setError(null);
+                  }}
                   placeholder="Describe what you want to build..."
                   rows={4}
                   disabled={isGenerating}
                 />
-                <button 
-                  onClick={generateCode}
-                  disabled={isGenerating || !prompt.trim()}
-                  className="generate-btn"
-                >
-                  {isGenerating ? '⏳ Generating...' : '✨ Generate'}
-                </button>
+                <div className="button-group">
+                  <button 
+                    onClick={generateCode}
+                    disabled={isGenerating || !prompt.trim()}
+                    className="generate-btn"
+                  >
+                    {isGenerating ? (
+                      <>
+                        <span className="btn-spinner"></span>
+                        <span>Generating...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>✨ Generate</span>
+                      </>
+                    )}
+                  </button>
+                  {error && !isGenerating && (
+                    <button 
+                      onClick={retryGeneration}
+                      className="retry-btn"
+                      title="Retry generation"
+                    >
+                      🔄 Retry
+                    </button>
+                  )}
+                </div>
               </div>
+
+              {runtimeErrors.length > 0 && (
+                <div className="error-fix-section">
+                  <h4>⚠️ Errors Detected ({runtimeErrors.length})</h4>
+                  <div className="error-list">
+                    {runtimeErrors.map((err, idx) => (
+                      <div key={idx} className="error-item">
+                        <span className="error-item-icon">❌</span>
+                        <div className="error-item-content">
+                          <span className="error-item-message">{err.message}</span>
+                          {err.path && <span className="error-item-path">in {err.path}</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="error-actions">
+                    <button 
+                      onClick={fixErrors}
+                      disabled={isFixing}
+                      className="fix-btn"
+                    >
+                      {isFixing ? (
+                        <>
+                          <span className="btn-spinner"></span>
+                          <span>Fixing...</span>
+                        </>
+                      ) : (
+                        <>
+                          <span>🔧 Auto-Fix Errors</span>
+                        </>
+                      )}
+                    </button>
+                    <button 
+                      onClick={clearRuntimeErrors}
+                      className="clear-errors-btn"
+                      disabled={isFixing}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {generationLog.length > 0 && (
                 <div className="activity-section">
@@ -552,6 +917,7 @@ export default function Button({ children, onClick }) {
                         files={files}
                         activeFile={activeFile}
                         onFileChange={handleFileChange}
+                        onErrorDetected={handleRuntimeError}
                       />
                     </div>
                   </SandpackProvider>
@@ -566,6 +932,7 @@ export default function Button({ children, onClick }) {
                   options={{ activeFile }}
                   customSetup={{ environment: "create-react-app" }}
                 >
+                  <PreviewErrorMonitor onErrorDetected={handleRuntimeError} />
                   <div className="preview-wrapper">
                     <SandpackPreview
                       showOpenInCodeSandbox={false}
