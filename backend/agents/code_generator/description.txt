@@ -1,0 +1,1 @@
+Generates production-ready React code using Claude AI based on technical plans

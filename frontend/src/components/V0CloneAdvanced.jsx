@@ -680,9 +680,8 @@ export default function Button({ children, onClick }) {
       {/* Top Bar */}
       <div className="top-bar">
         <div className="top-bar-left">
-          <div className="logo">V0</div>
+          <div className="logo">Gradientflo</div>
           <div className="project-info">
-            <h1>Modern React App</h1>
             <button className="view-project-btn">View Project</button>
           </div>
         </div>

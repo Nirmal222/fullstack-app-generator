@@ -1,0 +1,1 @@
+Validates and reviews React code quality, syntax, and best practices

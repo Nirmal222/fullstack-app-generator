@@ -1,0 +1,1 @@
+Analyzes user requirements and creates technical plans for React applications

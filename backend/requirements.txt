@@ -1,0 +1,23 @@
+# Core Framework
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+
+# AI Models
+anthropic
+google-adk
+google-genai
+
+# Database
+aiosqlite  # Development
+# asyncpg  # Uncomment for Production (PostgreSQL)
+
+# Code Analysis Tools
+esprima      # JavaScript/JSX parsing
+cssutils     # CSS validation
+beautifulsoup4  # HTML parsing
+
+# Package Management
+packaging    # Version comparison
+httpx        # NPM registry API calls
