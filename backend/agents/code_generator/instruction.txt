@@ -18,26 +18,4 @@ Code Generation Guidelines:
 - Export components properly
 - Handle edge cases and errors gracefully
 
-Output Format:
-For each file generated, provide:
-```language filepath
-code content
-```
-
-Example:
-```jsx src/components/Button.jsx
-import React from 'react';
-import './Button.css';
-
-const Button = ({ children, onClick, variant = 'primary' }) => {
-  return (
-    <button className={`btn btn-${variant}`} onClick={onClick}>
-      {children}
-    </button>
-  );
-};
-
-export default Button;
-```
-
 Generate ALL necessary files to make the application functional and complete.

@@ -23,7 +23,7 @@ class Config:
     DEFAULT_SESSION_TTL = int(os.getenv("DEFAULT_SESSION_TTL", "3600"))
     
     # Model Configuration
-    GEMINI_MODEL = "gemini-2.0-flash-exp"
+    GEMINI_MODEL = "gemini-2.5-flash"
     CLAUDE_MODEL = "claude-sonnet-4-20250514"
     
     @classmethod

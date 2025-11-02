@@ -222,6 +222,39 @@ export default function Button({ children, onClick }) {
   const [retryCount, setRetryCount] = useState(0);
   const [runtimeErrors, setRuntimeErrors] = useState([]);
   const [isFixing, setIsFixing] = useState(false);
+  
+  // ADK Session Management
+  const [sessionId, setSessionId] = useState(null);
+  const [currentPhase, setCurrentPhase] = useState(null);
+  const [sessions, setSessions] = useState([]);
+  const [showSessionPanel, setShowSessionPanel] = useState(false);
+  
+  // Connection status
+  const [connectionStatus, setConnectionStatus] = useState('checking'); // 'connected', 'disconnected', 'checking'
+  const [backendError, setBackendError] = useState(null);
+
+  // Check backend connection on mount
+  useEffect(() => {
+    const checkConnection = async () => {
+      try {
+        const response = await fetch('http://localhost:8000/health');
+        if (response.ok) {
+          setConnectionStatus('connected');
+          setBackendError(null);
+        } else {
+          setConnectionStatus('disconnected');
+          setBackendError(`Server returned ${response.status}`);
+        }
+      } catch (error) {
+        setConnectionStatus('disconnected');
+        setBackendError('Cannot connect to backend server');
+      }
+    };
+    
+    checkConnection();
+    const interval = setInterval(checkConnection, 30000); // Check every 30 seconds
+    return () => clearInterval(interval);
+  }, []);
 
   // File operations
   const handleFileChange = (filePath, content) => {
@@ -317,7 +350,42 @@ export default function Button({ children, onClick }) {
     setGenerationLog(prev => [...prev, `🗑️ Deleted ${filePath}`]);
   };
 
-  // Code generation
+  // ADK Session Management Functions
+  const loadSessions = async () => {
+    try {
+      const response = await fetch('http://localhost:8000/api/sessions?user_id=default_user');
+      if (response.ok) {
+        const data = await response.json();
+        setSessions(data.sessions || []);
+      }
+    } catch (error) {
+      console.error('Failed to load sessions:', error);
+    }
+  };
+
+  const continueWithSession = (sid) => {
+    setSessionId(sid);
+    setShowSessionPanel(false);
+    setGenerationLog(prev => [...prev, `🔄 Continuing session: ${sid}`]);
+  };
+
+  const clearSession = async (sid) => {
+    try {
+      await fetch('http://localhost:8000/api/sessions/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sid })
+      });
+      loadSessions();
+      if (sessionId === sid) {
+        setSessionId(null);
+      }
+    } catch (error) {
+      console.error('Failed to clear session:', error);
+    }
+  };
+
+  // Code generation with ADK support
   const generateCode = async () => {
     if (!prompt.trim()) {
       setError('Please enter a prompt to generate code');
@@ -327,11 +395,12 @@ export default function Button({ children, onClick }) {
     setIsGenerating(true);
     setGenerationLog([]);
     setError(null);
+    setCurrentPhase('initializing');
     const newFiles = {};
     let hasReceivedData = false;
 
     try {
-      // Check if backend is reachable
+      // Call ADK backend
       const response = await fetch('http://localhost:8000/api/generate', {
         method: 'POST',
         headers: {
@@ -340,9 +409,9 @@ export default function Button({ children, onClick }) {
         body: JSON.stringify({
           prompt: prompt,
           framework: 'react',
-          model: 'gpt-4'
+          session_id: sessionId || undefined
         }),
-        signal: AbortSignal.timeout(120000) // 2 minute timeout
+        signal: AbortSignal.timeout(180000) // 3 minute timeout for ADK
       });
 
       if (!response.ok) {
@@ -378,6 +447,35 @@ export default function Button({ children, onClick }) {
               const data = JSON.parse(line.slice(6));
 
               switch (data.type) {
+              // ADK-specific events
+              case 'session_created':
+                setSessionId(data.session_id);
+                setGenerationLog(prev => [...prev, `🔐 Session: ${data.session_id.substring(0, 8)}...`]);
+                break;
+
+              case 'agent_event':
+                if (data.phase) {
+                  setCurrentPhase(data.phase);
+                  const phaseEmoji = {
+                    'initializing': '🚀',
+                    'planning': '📋',
+                    'generating': '💻',
+                    'reviewing': '✅'
+                  };
+                  setGenerationLog(prev => [...prev, `${phaseEmoji[data.phase] || '⚙️'} ${data.phase.charAt(0).toUpperCase() + data.phase.slice(1)}...`]);
+                }
+                if (data.data?.content) {
+                  setGenerationLog(prev => [...prev, `  ${data.data.content.substring(0, 100)}...`]);
+                }
+                break;
+
+              case 'agent_response':
+                if (data.content) {
+                  setGenerationLog(prev => [...prev, `💬 ${data.content.substring(0, 150)}...`]);
+                }
+                break;
+
+              // Standard file events
               case 'file_start':
                 currentFile = data.file_path;
                 currentContent = '';
@@ -714,14 +812,40 @@ export default function Button({ children, onClick }) {
 
             <div className="chat-content">
               <div className="feature-list">
-                <h3>Current Features:</h3>
+                <h3>✨ Google ADK Powered Features:</h3>
                 <ul>
-                  <li>✨ AI-powered code generation</li>
-                  <li>📝 Monaco editor integration</li>
-                  <li>👁️ Live preview with hot reload</li>
-                  <li>📁 File tree management</li>
-                  <li>🎨 Syntax highlighting</li>
+                  <li>🧠 Multi-Agent System (Planning → Generate → Review)</li>
+                  <li>💾 Session Management & Continuity</li>
+                  <li>🔄 Automatic Error Recovery</li>
+                  <li>📝 Monaco Editor with Hot Reload</li>
+                  <li>👁️ Live Preview & File Management</li>
                 </ul>
+                {currentPhase && isGenerating && (
+                  <div className="phase-indicator">
+                    <h4>🔄 Current Phase:</h4>
+                    <div className={`phase-badge phase-${currentPhase}`}>
+                      {currentPhase === 'initializing' && '🚀 Initializing...'}
+                      {currentPhase === 'planning' && '📋 Planning Architecture...'}
+                      {currentPhase === 'generating' && '💻 Generating Code...'}
+                      {currentPhase === 'reviewing' && '✅ Reviewing & Validating...'}
+                    </div>
+                  </div>
+                )}
+                {sessionId && !isGenerating && (
+                  <div className="session-info">
+                    <small>🔐 Session: {sessionId.substring(0, 12)}...</small>
+                    <button 
+                      className="clear-session-btn"
+                      onClick={() => {
+                        setSessionId(null);
+                        setGenerationLog(prev => [...prev, '🗑️ Session cleared']);
+                      }}
+                      title="Start new session"
+                    >
+                      New Session
+                    </button>
+                  </div>
+                )}
               </div>
 
               <div className="prompt-section">
@@ -836,7 +960,16 @@ export default function Button({ children, onClick }) {
             </div>
 
             <div className="chat-footer">
-              <span>🔧 No issues found</span>
+              <div className="footer-left">
+                {connectionStatus === 'connected' && <span className="status-connected">🟢 Connected</span>}
+                {connectionStatus === 'disconnected' && <span className="status-disconnected">🔴 Disconnected</span>}
+                {connectionStatus === 'checking' && <span className="status-checking">🟡 Checking...</span>}
+                {backendError && connectionStatus === 'disconnected' && (
+                  <span className="backend-error" title={backendError}>
+                    ({backendError})
+                  </span>
+                )}
+              </div>
               <span>⏱️ Ready</span>
             </div>
           </div>

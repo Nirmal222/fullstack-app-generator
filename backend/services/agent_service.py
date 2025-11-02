@@ -11,6 +11,9 @@ import json
 
 from db import get_session_service
 from utils.config import Config
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 async def get_user_session(
@@ -29,29 +32,40 @@ async def get_user_session(
     Returns:
         Session object
     """
-    session_service = get_session_service()
-    app_name = app_name or Config.APP_NAME
+    logger.info(f"🔍 Getting session for user_id={user_id}, session_id={session_id}")
     
-    if session_id:
-        # Try to get existing session
-        try:
-            session = await session_service.get_session(
-                user_id=user_id,
-                session_id=session_id
-            )
-            if session:
-                return session
-        except Exception:
-            pass  # Create new session if get fails
-    
-    # Create new session
-    session = await session_service.create_session(
-        app_name=app_name,
-        user_id=user_id,
-        session_id=session_id
-    )
-    
-    return session
+    try:
+        session_service = get_session_service()
+        app_name = app_name or Config.APP_NAME
+        
+        if session_id:
+            # Try to get existing session
+            try:
+                logger.debug(f"Attempting to retrieve existing session: {session_id}")
+                session = await session_service.get_session(
+                    user_id=user_id,
+                    session_id=session_id
+                )
+                if session:
+                    logger.info(f"✅ Retrieved existing session: {session_id}")
+                    return session
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to retrieve session {session_id}: {str(e)}")
+                pass  # Create new session if get fails
+        
+        # Create new session
+        logger.info(f"🆕 Creating new session for user: {user_id}")
+        session = await session_service.create_session(
+            app_name=app_name,
+            user_id=user_id,
+            session_id=session_id
+        )
+        logger.info(f"✅ Created new session: {session.id}")
+        
+        return session
+    except Exception as e:
+        logger.error(f"❌ Failed to get/create session: {str(e)}", exc_info=True)
+        raise
 
 
 async def get_user_session_and_runner(
@@ -72,20 +86,28 @@ async def get_user_session_and_runner(
     Returns:
         Tuple of (Session, Runner)
     """
-    session_service = get_session_service()
-    app_name = app_name or Config.APP_NAME
+    logger.info(f"🏃 Creating runner for agent: {agent.name if hasattr(agent, 'name') else 'unknown'}")
     
-    # Get or create session
-    session = await get_user_session(user_id, session_id, app_name)
-    
-    # Create runner
-    runner = Runner(
-        agent=agent,
-        app_name=app_name,
-        session_service=session_service
-    )
-    
-    return session, runner
+    try:
+        session_service = get_session_service()
+        app_name = app_name or Config.APP_NAME
+        
+        # Get or create session
+        session = await get_user_session(user_id, session_id, app_name)
+        
+        # Create runner
+        logger.debug(f"Creating Runner with app_name={app_name}")
+        runner = Runner(
+            agent=agent,
+            app_name=app_name,
+            session_service=session_service
+        )
+        logger.info(f"✅ Runner created successfully for session: {session.id}")
+        
+        return session, runner
+    except Exception as e:
+        logger.error(f"❌ Failed to create runner: {str(e)}", exc_info=True)
+        raise
 
 
 async def run_agent_with_session(
@@ -104,14 +126,46 @@ async def run_agent_with_session(
     Yields:
         ADK events from agent execution
     """
-    events = runner.run_async(
-        user_id=session.user_id,
-        session_id=session.id,
-        new_message=content
-    )
+    logger.info(f"🚀 Running agent for session: {session.id}")
+    logger.debug(f"User message: {content.parts[0].text[:100] if content.parts else 'empty'}...")
     
-    async for event in events:
-        yield event
+    try:
+        event_count = 0
+        events = runner.run_async(
+            user_id=session.user_id,
+            session_id=session.id,
+            new_message=content
+        )
+        
+        async for event in events:
+            event_count += 1
+            logger.debug(f"📨 Event #{event_count}: author={getattr(event, 'author', 'unknown')}")
+            
+            # Handle state_delta for structured output_schema responses
+            state_delta = {}
+
+            # Newer ADK events surface state updates via actions.state_delta.
+            if getattr(getattr(event, 'actions', None), 'state_delta', None):
+                state_delta.update(event.actions.state_delta)
+
+            # Backwards compatibility for older event format.
+            if hasattr(event, 'state_delta') and event.state_delta:
+                state_delta.update(event.state_delta)
+
+            if state_delta:
+                logger.info(f"📊 State delta received: {list(state_delta.keys())}")
+                for key, value in state_delta.items():
+                    logger.debug(f"  - {key}: {type(value).__name__}")
+                    # Update session state with delta
+                    session.state[key] = value
+            
+            yield event
+        
+        logger.info(f"✅ Agent execution completed. Total events: {event_count}")
+        logger.debug(f"Final session state keys: {list(session.state.keys())}")
+    except Exception as e:
+        logger.error(f"❌ Agent execution failed: {str(e)}", exc_info=True)
+        raise
 
 
 def process_agent_event(event) -> Optional[Dict[str, Any]]:
@@ -124,50 +178,59 @@ def process_agent_event(event) -> Optional[Dict[str, Any]]:
     Returns:
         Dictionary with event data or None if event should be skipped
     """
-    # Skip events without content
-    if not event.content:
-        return None
-    
-    # Handle final response
-    if event.is_final_response():
+    try:
+        # Skip events without content
+        if not event.content:
+            logger.debug("Skipping event without content")
+            return None
+        
+        # Handle final response
+        if event.is_final_response():
+            if event.content.parts:
+                text = ''.join(part.text or '' for part in event.content.parts if part.text)
+                if text:
+                    logger.info(f"📝 Final response from {event.author}: {text[:100]}...")
+                    return {
+                        "type": "agent_response",
+                        "author": event.author,
+                        "content": text,
+                        "final": True
+                    }
+        
+        # Handle intermediate responses
         if event.content.parts:
             text = ''.join(part.text or '' for part in event.content.parts if part.text)
             if text:
+                logger.debug(f"💬 Intermediate response from {event.author}: {text[:50]}...")
                 return {
                     "type": "agent_response",
                     "author": event.author,
                     "content": text,
-                    "final": True
+                    "final": False
                 }
-    
-    # Handle intermediate responses
-    if event.content.parts:
-        text = ''.join(part.text or '' for part in event.content.parts if part.text)
-        if text:
-            return {
-                "type": "agent_response",
-                "author": event.author,
-                "content": text,
-                "final": False
-            }
-    
-    # Handle tool calls
-    if event.content.parts:
-        for part in event.content.parts:
-            if part.function_call:
-                return {
-                    "type": "tool_call",
-                    "tool": part.function_call.name,
-                    "args": part.function_call.args
-                }
-            if part.function_response:
-                return {
-                    "type": "tool_response",
-                    "tool": part.function_response.name,
-                    "response": part.function_response.response
-                }
-    
-    return None
+        
+        # Handle tool calls
+        if event.content.parts:
+            for part in event.content.parts:
+                if part.function_call:
+                    logger.info(f"🔧 Tool call: {part.function_call.name}")
+                    return {
+                        "type": "tool_call",
+                        "tool": part.function_call.name,
+                        "args": part.function_call.args
+                    }
+                if part.function_response:
+                    logger.info(f"🔧 Tool response: {part.function_response.name}")
+                    return {
+                        "type": "tool_response",
+                        "tool": part.function_response.name,
+                        "response": part.function_response.response
+                    }
+        
+        return None
+    except Exception as e:
+        logger.error(f"❌ Error processing event: {str(e)}", exc_info=True)
+        return None
 
 
 async def list_user_sessions(

@@ -8,8 +8,17 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import json
+import asyncio
 from typing import AsyncGenerator
 from google.genai import types
+from datetime import datetime
+
+# Import enhanced logging
+from utils.logger import setup_logging, get_logger
+
+# Setup logging
+setup_logging(level="DEBUG", log_file="backend.log")
+logger = get_logger(__name__)
 
 from models.schemas import (
     CodeGenerationRequest,
@@ -124,14 +133,19 @@ async def generate_code_with_adk(
     Yields:
         JSON-formatted events
     """
+    logger.info(f"🎯 Starting code generation for user: {user_id}")
+    logger.debug(f"Prompt: {prompt[:200]}...")
+    
     try:
         # Get session and runner
+        logger.info("📦 Initializing session and runner...")
         session, runner = await get_user_session_and_runner(
             user_id=user_id,
             agent=manager_agent,
             session_id=session_id
         )
         
+        logger.info(f"✅ Session created: {session.id}")
         yield json.dumps({
             "type": "session_created",
             "session_id": session.id,
@@ -144,15 +158,19 @@ async def generate_code_with_adk(
         )
         
         # Track agent responses
-        full_response = ""
         current_phase = "initializing"
+        generated_code = None
+        event_count = 0
         
         # Run agent and process events
+        logger.info("🤖 Running agent workflow...")
         async for event in run_agent_with_session(runner, session, content):
+            event_count += 1
             processed = process_agent_event(event)
             
             if processed:
                 # Track phases based on agent responses
+                old_phase = current_phase
                 if "planning" in processed.get("content", "").lower():
                     current_phase = "planning"
                 elif "generat" in processed.get("content", "").lower():
@@ -160,33 +178,66 @@ async def generate_code_with_adk(
                 elif "review" in processed.get("content", "").lower():
                     current_phase = "reviewing"
                 
+                if old_phase != current_phase:
+                    logger.info(f"📍 Phase transition: {old_phase} → {current_phase}")
+                
                 yield json.dumps({
                     "type": "agent_event",
                     "phase": current_phase,
                     "data": processed
                 }) + "\n"
-                
-                # Accumulate final response
-                if processed.get("final") and processed.get("content"):
-                    full_response += processed["content"]
         
-        # Parse and stream generated code
-        if full_response:
-            files = parse_code_from_response(full_response)
+        logger.info(f"✅ Agent workflow completed. Processed {event_count} events")
+        
+        # Extract generated code from session state
+        logger.info("🔍 Extracting generated code from session state...")
+        logger.debug(f"Session state keys: {list(session.state.keys())}")
+        
+        # The output_schema key is defined in the agent (output_key="generated_code")
+        generated_code = session.state.get("generated_code")
+        
+        if generated_code:
+            logger.info(f"📄 Generated code found: {type(generated_code)}")
             
-            if files:
-                for file_path, content in files.items():
+            # Handle both dict and Pydantic model instances
+            if hasattr(generated_code, 'model_dump'):
+                # It's a Pydantic model, convert to dict
+                logger.debug("Converting Pydantic model to dict")
+                generated_code = generated_code.model_dump()
+            elif hasattr(generated_code, 'dict'):
+                # Older Pydantic version
+                logger.debug("Converting Pydantic model to dict (legacy)")
+                generated_code = generated_code.dict()
+            
+            if isinstance(generated_code, dict):
+                logger.debug(f"Generated code keys: {list(generated_code.keys())}")
+            else:
+                logger.warning(f"⚠️ Unexpected generated_code type: {type(generated_code)}")
+        else:
+            logger.warning("⚠️ No generated_code found in session state")
+        
+        # Stream generated code files
+        if generated_code and isinstance(generated_code, dict):
+            files_data = generated_code.get("files", [])
+            logger.info(f"📁 Found {len(files_data)} files to stream")
+            
+            if files_data:
+                for idx, file_data in enumerate(files_data, 1):
+                    file_path = file_data.get("path", "unknown.js")
+                    file_content = file_data.get("content", "")
+                    logger.info(f"📄 Streaming file {idx}/{len(files_data)}: {file_path} ({len(file_content)} chars)")
+                    
                     # Send file start
                     yield json.dumps({
                         "type": "file_start",
                         "file_path": file_path,
-                        "metadata": {"size": len(content)}
+                        "metadata": {"size": len(file_content)}
                     }) + "\n"
                     
                     # Stream content in chunks
                     chunk_size = 100
-                    for i in range(0, len(content), chunk_size):
-                        chunk = content[i:i + chunk_size]
+                    for i in range(0, len(file_content), chunk_size):
+                        chunk = file_content[i:i + chunk_size]
                         yield json.dumps({
                             "type": "content",
                             "file_path": file_path,
@@ -199,24 +250,36 @@ async def generate_code_with_adk(
                         "file_path": file_path
                     }) + "\n"
                 
+                logger.info(f"✅ Successfully streamed {len(files_data)} files")
+                
                 # Send completion
                 yield json.dumps({
                     "type": "complete",
                     "session_id": session.id,
                     "metadata": {
-                        "total_files": len(files),
-                        "message": f"Generated {len(files)} file(s) successfully"
+                        "total_files": len(files_data),
+                        "message": f"Generated {len(files_data)} file(s) successfully"
                     }
                 }) + "\n"
             else:
-                # No files parsed, return raw response
+                # No files generated
+                logger.error("❌ No files in generated_code.files array")
                 yield json.dumps({
-                    "type": "agent_response",
-                    "content": full_response,
+                    "type": "error",
+                    "message": "No files were generated. Please try again.",
                     "session_id": session.id
                 }) + "\n"
+        else:
+            # No generated_code in state
+            logger.error(f"❌ Invalid generated_code: type={type(generated_code)}, value={generated_code}")
+            yield json.dumps({
+                "type": "error",
+                "message": "Code generation did not complete. Please try again.",
+                "session_id": session.id
+            }) + "\n"
         
     except Exception as e:
+        logger.error(f"❌ Fatal error in code generation: {str(e)}", exc_info=True)
         yield json.dumps({
             "type": "error",
             "message": f"Error generating code: {str(e)}"
@@ -229,14 +292,20 @@ async def generate_code(request: CodeGenerationRequest):
     Generate code using ADK multi-agent system
     Supports session continuity for iterative improvements
     """
+    logger.info(f"📥 New generation request - Prompt: {request.prompt[:50]}...")
+    logger.info(f"🔐 Session ID: {request.session_id or 'New session'}")
+    
     async def event_stream():
         try:
+            logger.info("🚀 Starting code generation stream")
             async for chunk in generate_code_with_adk(
                 prompt=request.prompt,
                 session_id=request.session_id
             ):
                 yield f"data: {chunk}\n\n"
+            logger.info("✅ Code generation completed successfully")
         except Exception as e:
+            logger.error(f"❌ Generation error: {str(e)}", exc_info=True)
             error_data = json.dumps({
                 "type": "error",
                 "message": str(e)

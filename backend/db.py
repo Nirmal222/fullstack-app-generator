@@ -21,7 +21,7 @@ def get_session_service() -> DatabaseSessionService:
     Returns:
         DatabaseSessionService instance configured for the database
     """
-    return DatabaseSessionService(database_url=DATABASE_URL)
+    return DatabaseSessionService(db_url=DATABASE_URL)
 
 
 async def init_database():

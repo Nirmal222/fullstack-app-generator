@@ -9,7 +9,7 @@ import re
 
 def auto_fix_common_errors(
     code: str,
-    errors: List[Dict],
+    errors: List[Dict[str, Any]],
     tool_context: ToolContext
 ) -> Dict[str, Any]:
     """

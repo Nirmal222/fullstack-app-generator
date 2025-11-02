@@ -2,8 +2,7 @@
 Review Agent - Validates and reviews code quality
 """
 
-from google.adk import Agent
-from google.genai import types
+from google.adk.agents import LlmAgent
 from utils.config import Config
 from utils.file_utils import read_instruction_file, read_description_file
 from tools.validation_tools import (
@@ -22,7 +21,7 @@ from tools.error_recovery_tools import (
 
 
 # Create Review Agent with validation tools
-review_agent = Agent(
+review_agent = LlmAgent(
     model=Config.GEMINI_MODEL,
     name="review_agent",
     instruction=read_instruction_file(__file__),
@@ -35,10 +34,5 @@ review_agent = Agent(
         check_package_compatibility,
         auto_fix_common_errors,
         suggest_error_fix
-    ],
-    generation_config=types.GenerationConfig(
-        temperature=0.3,
-        top_p=0.9,
-        max_output_tokens=2048
-    )
+    ]
 )
